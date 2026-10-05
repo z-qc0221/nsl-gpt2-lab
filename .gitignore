@@ -2,6 +2,10 @@
 /models/
 *finished.py
 
+# Junk: a literal "%SystemDrive%" folder created when a script failed to
+# expand the environment variable (PowerShell does not expand %VAR%).
+/%SystemDrive%/
+
 ### Python ###
 
 # Byte-compiled / optimized / DLL files
