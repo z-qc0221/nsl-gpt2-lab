@@ -53,3 +53,24 @@ When we use the **1558M** model for autoregressive inference, the returned resul
 
 In the 1950s, he proposed a way to build a computer that could think like a human. He called it the "T
 ```
+
+### Greedy speculative decoding
+
+`NSL-gpt2.py` also implements greedy speculative decoding. By default, the
+target model is **1558M** and the draft model is **124M**. The target model
+verifies a group of draft tokens in one forward pass; a rejected draft token is
+replaced by the target model's greedy token. Therefore, its generated text is
+identical to normal greedy decoding with the 1558M target model.
+
+```bash
+python NSL-gpt2.py \
+    "Alan Turing theorized that computers would one day become" \
+    --n_tokens_to_generate 40 \
+    --model_size "1558M" \
+    --draft_model_size "124M" \
+    --speculative_k 4
+```
+
+`--speculative_k` is the number of tokens proposed per round. To measure the
+1558M autoregressive baseline with the same script, set
+`--use_speculative=False`.

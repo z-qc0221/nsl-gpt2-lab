@@ -20,6 +20,36 @@ def kv_cache_len():
     return kv_cache[0][0][0].shape[0]
 
 
+# 投机推理会在草稿模型和目标模型之间切换。下面两个函数只复制 cache 的
+# ``list`` 结构，而不复制其中很大的 K/V Tensor；mha 每次追加 token 时都会
+# 生成新的 Tensor，因此这个浅拷贝足以保存一个可回滚的 cache 检查点。
+def snapshot_kv_cache():
+    return [[head[:] for head in layer] for layer in kv_cache]
+
+
+def restore_kv_cache(cache_snapshot):
+    global kv_cache
+    # 再复制一次 list，避免下一次 mha 写 cache 时修改传入的检查点。
+    kv_cache = [[head[:] for head in layer] for layer in cache_snapshot]
+
+
+def truncate_kv_cache(length):
+    """将所有层的 KV Cache 回滚到 ``length`` 个已处理 token。"""
+    if length < 0:
+        raise ValueError("KV Cache length must be non-negative")
+
+    for layer in kv_cache:
+        for head in layer:
+            k, v = head
+            if k is None:
+                continue
+            if length > k.shape[0]:
+                raise ValueError("Cannot extend a KV Cache while rolling it back")
+            # K/V 的第 0 维是序列长度；切片不会复制大 Tensor。
+            head[0] = k[:length]
+            head[1] = v[:length]
+
+
 def gelu(x):
     """
         Task: Use the torch API to implement the approximate calculation formula of the `GELU`
@@ -245,30 +275,159 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
             list: A list of newly generated token IDs.
             
     """
+    if n_tokens_to_generate <= 0:
+        clear_kv_cache()
+        return []
+    if K <= 0:
+        raise ValueError("K must be a positive integer")
+
+    draft_n_head = hparams_draft["n_head"]
+    target_n_head = hparams_target["n_head"]
+    max_context = min(hparams_draft["n_ctx"], hparams_target["n_ctx"])
+    if len(inputs) + n_tokens_to_generate >= max_context:
+        raise ValueError("Prompt plus generated tokens exceeds the model context length")
+
     generated_ids = []
-    current_inputs = list(inputs)
 
-    while len(generated_ids) < n_tokens_to_generate:
-        pass
+    try:
+        # 修改：分别预填充两套 cache。全局 kv_cache 是原代码的存储方式，
+        # 因此在模型之间切换时用 snapshot/restore 保存各自的状态。
+        reset_kv_cache(len(draft_params["blocks"]), draft_n_head)
+        draft_next_logits = gpt2(inputs, draft_params, draft_n_head, n_past=0)
+        draft_cache = snapshot_kv_cache()
 
-    return generated_ids
+        reset_kv_cache(len(target_params["blocks"]), target_n_head)
+        target_next_logits = gpt2(inputs, target_params, target_n_head, n_past=0)
+        target_cache = snapshot_kv_cache()
+
+        while len(generated_ids) < n_tokens_to_generate:
+            batch_size = min(K, n_tokens_to_generate - len(generated_ids))
+
+            # 修改：草稿模型贪心地产生最多 K 个候选 token。产生第 i+1 个候选
+            # 前，将第 i 个候选写入它自己的 KV Cache。
+            restore_kv_cache(draft_cache)
+            draft_prefix_len = kv_cache_len()
+            proposed_ids = []
+            draft_logits = draft_next_logits
+            for proposal_index in range(batch_size):
+                proposed_id = int(torch.argmax(draft_logits[-1]).item())
+                proposed_ids.append(proposed_id)
+                if proposal_index < batch_size - 1:
+                    draft_logits = gpt2(
+                        [proposed_id],
+                        draft_params,
+                        draft_n_head,
+                        n_past=kv_cache_len(),
+                    )
+            # 此时草稿 cache 少最后一个候选 token；保留它用于发生拒绝时回滚。
+            draft_after_proposals = snapshot_kv_cache()
+
+            # 修改：目标模型一次前向传播验证整段候选。第一个候选应与此前
+            # prefill 的 logits 比较，之后第 i 个候选与第 i-1 行验证 logits 比较。
+            restore_kv_cache(target_cache)
+            target_prefix_len = kv_cache_len()
+            verification_logits = gpt2(
+                proposed_ids,
+                target_params,
+                target_n_head,
+                n_past=target_prefix_len,
+            )
+            target_after_proposals = snapshot_kv_cache()
+            target_ids = [int(torch.argmax(target_next_logits[-1]).item())]
+            target_ids.extend(
+                int(torch.argmax(verification_logits[index - 1]).item())
+                for index in range(1, batch_size)
+            )
+
+            accepted_count = 0
+            for proposed_id, target_id in zip(proposed_ids, target_ids):
+                if proposed_id != target_id:
+                    break
+                accepted_count += 1
+
+            generated_ids.extend(proposed_ids[:accepted_count])
+
+            if accepted_count == batch_size:
+                # 修改：整段被接受。目标模型最后一行 logits 已经是下一 token
+                # 的预测；草稿模型只需补写最后一个候选 token 即可继续下一轮。
+                target_cache = target_after_proposals
+                target_next_logits = verification_logits[-1:]
+
+                restore_kv_cache(draft_after_proposals)
+                draft_next_logits = gpt2(
+                    [proposed_ids[-1]],
+                    draft_params,
+                    draft_n_head,
+                    n_past=kv_cache_len(),
+                )
+                draft_cache = snapshot_kv_cache()
+            else:
+                # 修改：首个不一致位置直接采用目标模型的贪心 token。两套 cache
+                # 都回滚到「已接受候选」后，再写入该 token；这样被拒绝的草稿
+                # token 永远不会污染下一轮推理。
+                correction_id = target_ids[accepted_count]
+                generated_ids.append(correction_id)
+
+                restore_kv_cache(target_after_proposals)
+                truncate_kv_cache(target_prefix_len + accepted_count)
+                target_next_logits = gpt2(
+                    [correction_id],
+                    target_params,
+                    target_n_head,
+                    n_past=kv_cache_len(),
+                )
+                target_cache = snapshot_kv_cache()
+
+                restore_kv_cache(draft_after_proposals)
+                truncate_kv_cache(draft_prefix_len + accepted_count)
+                draft_next_logits = gpt2(
+                    [correction_id],
+                    draft_params,
+                    draft_n_head,
+                    n_past=kv_cache_len(),
+                )
+                draft_cache = snapshot_kv_cache()
+
+        return generated_ids
+    finally:
+        # 函数结束后不把任一模型的 cache 泄漏给普通 generate 调用。
+        clear_kv_cache()
 
 
-def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models"):
+def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "1558M", models_dir: str = "models", draft_model_size: str = "124M", speculative_k: int = 4, use_speculative: bool = True):
     from utils import load_encoder_hparams_and_params
 
-    # load encoder, hparams, and params from the released open-ai gpt-2 files
-    encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    # 修改：投机推理默认同时加载 124M 草稿模型与 model_size（默认 1558M）
+    # 目标模型。二者共用 GPT-2 的 tokenizer，因此使用目标模型的 encoder 即可。
+    encoder, hparams_target, target_params = load_encoder_hparams_and_params(model_size, models_dir)
+    if use_speculative:
+        _, hparams_draft, draft_params = load_encoder_hparams_and_params(draft_model_size, models_dir)
 
     # encode the input string using the BPE tokenizer
     input_ids = encoder.encode(prompt)
 
     # make sure we are not surpassing the max sequence length of our model
-    assert len(input_ids) + n_tokens_to_generate < hparams["n_ctx"]
+    if use_speculative:
+        max_context = min(hparams_draft["n_ctx"], hparams_target["n_ctx"])
+    else:
+        max_context = hparams_target["n_ctx"]
+    assert len(input_ids) + n_tokens_to_generate < max_context
 
     # generate output ids
     start = time.time()
-    output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
+    if use_speculative:
+        output_ids = greedy_speculative_generate(
+            input_ids,
+            draft_params,
+            target_params,
+            hparams_draft,
+            hparams_target,
+            n_tokens_to_generate,
+            speculative_k,
+        )
+    else:
+        # 保留普通自回归路径，便于与投机推理的输出/耗时进行对照。
+        output_ids = generate(input_ids, target_params, hparams_target["n_head"], n_tokens_to_generate)
     end = time.time()
     print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
 
