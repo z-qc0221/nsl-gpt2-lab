@@ -74,3 +74,25 @@ python NSL-gpt2.py \
 `--speculative_k` is the number of tokens proposed per round. To measure the
 1558M autoregressive baseline with the same script, set
 `--use_speculative=False`.
+
+### Latency-oriented implementation details
+
+The speculative path further reduces Python and memory-management overhead
+without changing greedy decisions:
+
+* KV tensors are preallocated once for the prompt plus requested output length.
+  Appending a token is an in-place write, while rollback only restores a cache
+  length; it does not concatenate or copy the historical K/V tensors.
+* Attention runs all heads as one batched operation instead of invoking a
+  separate attention and `torch.cat` for every head.
+* If the initial draft token already differs from the target token, the decoder
+  immediately reuses the target KV cache and finishes with normal target-model
+  greedy decoding instead of verifying a doomed K-token block. It also applies
+  the same fallback after consecutive first-token rejections in later rounds.
+  This avoids negative speedups on low-acceptance prompts while keeping the
+  output exactly unchanged. Set `--fallback_on_first_mismatch=False` and
+  `--fallback_after_rejections=0` to disable these safeguards.
+
+For CPU measurements, test several `--speculative_k` values (usually 2, 4,
+6, and 8) on the same prompt and output length. The best value depends on the
+draft acceptance rate and the target machine's matrix-multiplication behavior.
